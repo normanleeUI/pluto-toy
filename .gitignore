@@ -1,7 +1,9 @@
 # Generated artifacts (regenerable)
 data/
+data_v3/
 runs/
 sweep/
+prompts/
 sweep_small/
 sweep_large/
 sweep_grid/
@@ -17,3 +19,18 @@ __pycache__/
 
 # OS
 .DS_Store
+
+# IDE / editor
+.idea
+.vscode
+
+# Shell / sandbox dotfiles
+.bash_profile
+.bashrc
+.gitconfig
+.gitmodules
+.mcp.json
+.profile
+.ripgreprc
+.zprofile
+.zshrc

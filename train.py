@@ -10,7 +10,9 @@ CPU-friendly defaults; pass --device mps or --device cuda to use an
 accelerator. A 50K-parameter run trains canon-only in ~1-2 minutes
 on a laptop CPU.
 """
+
 import argparse
+import json
 import math
 from pathlib import Path
 
@@ -28,8 +30,8 @@ def load_data(path, tokenizer, device):
 
 def get_batch(data, block_size, batch_size):
     ix = torch.randint(0, len(data) - block_size - 1, (batch_size,))
-    x = torch.stack([data[i:i + block_size] for i in ix])
-    y = torch.stack([data[i + 1:i + block_size + 1] for i in ix])
+    x = torch.stack([data[i : i + block_size] for i in ix])
+    y = torch.stack([data[i + 1 : i + block_size + 1] for i in ix])
     return x, y
 
 
@@ -39,8 +41,19 @@ def cosine_lr(step, total, lr_max, lr_min):
     return lr_min + 0.5 * (lr_max - lr_min) * (1 + math.cos(math.pi * step / total))
 
 
-def train_phase(model, data, *, steps, batch_size, block_size,
-                lr_max, lr_min, optimizer=None, log_every=100, name=""):
+def train_phase(
+    model,
+    data,
+    *,
+    steps,
+    batch_size,
+    block_size,
+    lr_max,
+    lr_min,
+    optimizer=None,
+    log_every=100,
+    name="",
+):
     device = next(model.parameters()).device
     if optimizer is None:
         optimizer = torch.optim.AdamW(
@@ -59,15 +72,29 @@ def train_phase(model, data, *, steps, batch_size, block_size,
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         if step % log_every == 0 or step == 1:
-            print(f"  [{name:9s}] step {step:5d}/{steps}  loss {loss.item():.4f}  lr {lr:.5f}")
+            print(
+                f"  [{name:9s}] step {step:5d}/{steps}  loss {loss.item():.4f}  lr {lr:.5f}"
+            )
     return optimizer
+
+
+def load_tokenizer(path):
+    """Load a tokenizer from JSON, auto-detecting class from the file contents."""
+    tok_meta = json.loads(Path(path).read_text())
+    if tok_meta.get("tokenizer_class") == "v3":
+        from tokenizer_v3 import TokenizerV3
+
+        return TokenizerV3.load(path)
+    return WordTokenizer.load(path)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data-dir", default="data")
     ap.add_argument("--out-dir", required=True)
-    ap.add_argument("--schedule", choices=["canon-only", "curriculum", "mixed"], required=True)
+    ap.add_argument(
+        "--schedule", choices=["canon-only", "curriculum", "mixed"], required=True
+    )
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--seed", type=int, default=0)
     # model
@@ -81,18 +108,28 @@ def main():
     ap.add_argument("--batch-size", type=int, default=32)
     ap.add_argument("--lr-max", type=float, default=3e-3)
     ap.add_argument("--lr-min", type=float, default=3e-4)
+    ap.add_argument(
+        "--tokenizer",
+        default=None,
+        help="Path to pre-fitted tokenizer JSON (auto-detects class)",
+    )
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
 
-    # Fit tokenizer on phase1 ∪ phase2 so phase-2 entity names already
-    # have stable IDs and embeddings during phase 1 training.
     p1_path = Path(args.data_dir) / "phase1.txt"
     p2_path = Path(args.data_dir) / "phase2.txt"
-    text = p1_path.read_text() + "\n" + p2_path.read_text()
-    tokenizer = WordTokenizer.fit(text)
+
+    if args.tokenizer:
+        tokenizer = load_tokenizer(args.tokenizer)
+    else:
+        # Fit tokenizer on phase1 + phase2 so phase-2 entity names already
+        # have stable IDs and embeddings during phase 1 training.
+        text = p1_path.read_text() + "\n" + p2_path.read_text()
+        tokenizer = WordTokenizer.fit(text)
+
     tokenizer.save(out / "tokenizer.json")
 
     cfg = GPTConfig(
@@ -103,10 +140,17 @@ def main():
         n_embd=args.n_embd,
     )
     model = GPT(cfg).to(args.device)
-    print(f"vocab_size={cfg.vocab_size}  params={model.num_params():,}  device={args.device}")
+    print(
+        f"vocab_size={cfg.vocab_size}  params={model.num_params():,}  device={args.device}"
+    )
 
     p1 = load_data(p1_path, tokenizer, args.device)
     p2 = load_data(p2_path, tokenizer, args.device)
+
+    if len(p2) == 0 and args.schedule in ("curriculum", "mixed"):
+        raise ValueError(
+            f"Phase 2 data is empty — cannot train with schedule '{args.schedule}'"
+        )
 
     common = dict(
         batch_size=args.batch_size,
@@ -121,17 +165,27 @@ def main():
     elif args.schedule == "curriculum":
         opt = train_phase(model, p1, steps=args.phase1_steps, name="canon", **common)
         torch.save(
-            {"model_state": model.state_dict(), "config": cfg.__dict__,
-             "schedule": "curriculum-phase1", "args": vars(args)},
+            {
+                "model_state": model.state_dict(),
+                "config": cfg.__dict__,
+                "schedule": "curriculum-phase1",
+                "args": vars(args),
+            },
             out / "ckpt_phase1.pt",
         )
         # Phase 2 fine-tunes on a small evidence corpus. Continue the
         # cosine into a low LR floor — we want to *bend* the canon
         # representation, not overwrite it in a few aggressive steps.
         train_phase(
-            model, p2, steps=args.phase2_steps, name="evidence", optimizer=opt,
-            batch_size=args.batch_size, block_size=args.block_size,
-            lr_max=args.lr_min, lr_min=args.lr_min / 10,
+            model,
+            p2,
+            steps=args.phase2_steps,
+            name="evidence",
+            optimizer=opt,
+            batch_size=args.batch_size,
+            block_size=args.block_size,
+            lr_max=args.lr_min,
+            lr_min=args.lr_min / 10,
         )
 
     elif args.schedule == "mixed":
@@ -139,8 +193,12 @@ def main():
         train_phase(model, joint, steps=args.phase1_steps, name="mixed", **common)
 
     torch.save(
-        {"model_state": model.state_dict(), "config": cfg.__dict__,
-         "schedule": args.schedule, "args": vars(args)},
+        {
+            "model_state": model.state_dict(),
+            "config": cfg.__dict__,
+            "schedule": args.schedule,
+            "args": vars(args),
+        },
         out / "ckpt.pt",
     )
     print(f"saved {out / 'ckpt.pt'}")
