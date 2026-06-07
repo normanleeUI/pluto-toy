@@ -1,11 +1,17 @@
 """Tests for the v3 continuous-feature entity generation logic."""
 
+import json
 import math
 import random
+import re
+import subprocess
+import sys
 
 import pytest
 
 from generate_corpus_v3 import (
+    build_phase1_continuous,
+    build_phase2_continuous,
     describe_continuous,
     label,
     sample_canonical_continuous,
@@ -181,3 +187,236 @@ def test_identical_seeds_produce_identical_results():
     r1 = sample_canonical_continuous("planet", 10, rng1)
     r2 = sample_canonical_continuous("planet", 10, rng2)
     assert r1 == r2
+
+
+# -- build_phase1_continuous ---------------------------------------------------
+
+
+def test_build_phase1_produces_all_entities(seeded_rng):
+    text, entities = build_phase1_continuous(seeded_rng, "digit")
+    assert len(entities) == 28
+    # 10 planets, 6 each of asteroid/comet/moon
+    cats = [cat for cat, _ in entities.values()]
+    assert cats.count("planet") == 10
+    assert cats.count("asteroid") == 6
+    assert cats.count("comet") == 6
+    assert cats.count("moon") == 6
+    assert "P10" in entities
+    assert entities["P10"][0] == "planet"
+
+
+def test_build_phase1_text_contains_roster_lines(seeded_rng):
+    text, entities = build_phase1_continuous(seeded_rng, "digit")
+    planet_names = {n for n, (c, _) in entities.items() if c == "planet"}
+    found = False
+    for line in text.splitlines():
+        if line.startswith("the planets are "):
+            found = True
+            roster_body = line[len("the planets are ") : -len(" .")]
+            parts = roster_body.split(" and ")
+            assert set(parts) == planet_names, (
+                f"Roster parts {parts} != expected {planet_names}"
+            )
+    assert found, "No planet roster line found"
+
+
+def test_build_phase1_digit_sentence_fits_block_size(seeded_rng):
+    text, _ = build_phase1_continuous(seeded_rng, "digit")
+    for line in text.splitlines():
+        if " has mass " not in line:
+            continue
+        # Simulate TokenizerV3 preprocessing: split digits into chars
+        tokens = []
+        for tok in line.split():
+            if re.match(r"^\d+\.?\d*$", tok):
+                tokens.extend(list(tok))
+            else:
+                tokens.append(tok)
+        assert len(tokens) < 40, (
+            f"Description line has {len(tokens)} tokens (>= 40): {line}"
+        )
+
+
+# -- build_phase2_continuous ---------------------------------------------------
+
+
+def test_build_phase2_overlap_entities_near_p10(seeded_rng):
+    _, p1_ents = build_phase1_continuous(seeded_rng, "digit")
+    p10_feats = p1_ents["P10"][1]
+    rng2 = random.Random(99)
+    _, eris = build_phase2_continuous(
+        rng2,
+        "digit",
+        "dwarf",
+        n_eris=6,
+        n_eris_rote=0,
+        p10_feats=p10_feats,
+    )
+    for name, feats in eris.items():
+        assert abs(feats[0] - p10_feats[0]) < 20, (
+            f"{name} mass {feats[0]:.1f} not within 20 of P10 mass {p10_feats[0]:.1f}"
+        )
+
+
+def test_build_phase2_rote_entities_in_disjoint_corner(seeded_rng):
+    _, eris = build_phase2_continuous(
+        seeded_rng,
+        "digit",
+        "dwarf",
+        n_eris=6,
+        n_eris_rote=3,
+    )
+    # First 3 are disjoint (huge mass), last 3 are overlap (small mass)
+    for i in range(1, 4):
+        assert eris[f"E{i}"][0] > 400, f"E{i} mass should be > 400 (disjoint)"
+    for i in range(4, 7):
+        assert eris[f"E{i}"][0] < 100, f"E{i} mass should be < 100 (overlap)"
+
+
+def test_build_phase2_mode_unlabeled_no_labels(seeded_rng):
+    text, _ = build_phase2_continuous(seeded_rng, "digit", "unlabeled")
+    assert "is a" not in text
+
+
+def test_build_phase2_mode_dwarf_has_labels(seeded_rng):
+    text, eris = build_phase2_continuous(seeded_rng, "digit", "dwarf")
+    for name in eris:
+        assert f"{name} is a dwarf ." in text
+
+
+# -- main() / CLI --------------------------------------------------------------
+
+
+def test_entities_json_schema_matches_v2(tmp_corpus_dir):
+    out = str(tmp_corpus_dir / "schema_test")
+    subprocess.run(
+        [
+            sys.executable,
+            "generate_corpus_v3.py",
+            "--out-dir",
+            out,
+            "--mode",
+            "dwarf",
+            "--representation",
+            "digit",
+            "--seed",
+            "0",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    data = json.loads((tmp_corpus_dir / "schema_test" / "entities.json").read_text())
+    required_keys = {
+        "phase1",
+        "phase2",
+        "phase2_mode",
+        "n_eris_rote",
+        "n_eris",
+        "p10_edge",
+        "representation",
+    }
+    assert required_keys.issubset(data.keys())
+    assert "rote_control" not in data
+    p1_entry = next(iter(data["phase1"].values()))
+    assert "category" in p1_entry
+    assert "features" in p1_entry
+    assert len(p1_entry["features"]) == 3
+    assert all(isinstance(f, float) for f in p1_entry["features"])
+
+
+def test_cli_produces_output_files(tmp_corpus_dir):
+    out = str(tmp_corpus_dir / "cli_out")
+    result = subprocess.run(
+        [
+            sys.executable,
+            "generate_corpus_v3.py",
+            "--out-dir",
+            out,
+            "--mode",
+            "dwarf",
+            "--representation",
+            "digit",
+            "--seed",
+            "42",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, f"CLI failed: {result.stderr}"
+    assert (tmp_corpus_dir / "cli_out" / "phase1.txt").exists()
+    assert (tmp_corpus_dir / "cli_out" / "phase2.txt").exists()
+    assert (tmp_corpus_dir / "cli_out" / "entities.json").exists()
+    phase1 = (tmp_corpus_dir / "cli_out" / "phase1.txt").read_text()
+    assert "kg" in phase1
+
+
+def test_ordinal_representation_matches_v2_format(seeded_rng):
+    text, _ = build_phase1_continuous(seeded_rng, "ordinal")
+    assert "kg" not in text
+    assert "km" not in text
+    assert "AU" not in text
+    ordinal_words = {"tiny", "small", "medium", "large", "huge", "near", "distant"}
+    found = ordinal_words & set(text.split())
+    assert len(found) >= 2, f"Expected ordinal vocab words, found only {found}"
+    assert re.search(r"\w+ has mass \w+ diameter \w+ orbit \w+ \.", text)
+
+
+# -- Edge case tests -----------------------------------------------------------
+
+
+def test_reproducibility_byte_identical(tmp_corpus_dir):
+    """Same seed produces byte-identical output files."""
+    for run_dir in ["run1", "run2"]:
+        subprocess.run(
+            [
+                sys.executable,
+                "generate_corpus_v3.py",
+                "--out-dir",
+                str(tmp_corpus_dir / run_dir),
+                "--seed",
+                "7",
+                "--mode",
+                "dwarf",
+                "--representation",
+                "digit",
+            ],
+            check=True,
+            capture_output=True,
+        )
+    for fname in ["phase1.txt", "phase2.txt", "entities.json"]:
+        f1 = (tmp_corpus_dir / "run1" / fname).read_bytes()
+        f2 = (tmp_corpus_dir / "run2" / fname).read_bytes()
+        assert f1 == f2, f"{fname} differs between runs"
+
+
+def test_n_eris_zero_produces_empty_phase2(seeded_rng):
+    text, eris = build_phase2_continuous(seeded_rng, "digit", "unlabeled", n_eris=0)
+    assert text == ""
+    assert eris == {}
+
+
+def test_mode_planet_labels_entities(seeded_rng):
+    text, eris = build_phase2_continuous(seeded_rng, "digit", "planet")
+    for name in eris:
+        assert f"{name} is a planet ." in text
+
+
+def test_n_eris_rote_exceeds_n_eris_raises(seeded_rng):
+    with pytest.raises(ValueError, match="n_eris_rote"):
+        build_phase2_continuous(seeded_rng, "digit", "dwarf", n_eris=3, n_eris_rote=5)
+
+
+def test_cli_invalid_representation_exits_with_error(tmp_corpus_dir):
+    result = subprocess.run(
+        [
+            sys.executable,
+            "generate_corpus_v3.py",
+            "--out-dir",
+            str(tmp_corpus_dir),
+            "--representation",
+            "bogus",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
