@@ -1,0 +1,17 @@
+[project]
+name = "pluto-toy"
+version = "0.3.0"
+description = "Category-strain experiments with a toy transformer"
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-cov",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
